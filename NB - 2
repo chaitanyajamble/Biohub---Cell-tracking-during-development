@@ -1,0 +1,803 @@
+# ------------------------------------------------------------
+# Imports and environment setup
+# -------------------------------------------------------------------------
+import os
+import gc
+import sys
+import time
+import json
+import warnings
+import traceback
+import importlib
+import subprocess
+import concurrent.futures
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+CFG_OFFLINE_WHEELHOUSE = "/---/input/zarr-offline-wheels"
+# fallback guess only; _autodetect_wheelhouse() below does the real work
+
+
+def _autodetect_wheelhouse(default_path):
+    """Scan /---/input/*/ for a folder that actually contains the zarr
+    wheel, since the exact mounted dataset-folder name can differ from
+    what you'd expect from the ---.com dataset URL.
+
+    --- mounts an attached dataset inside a notebook at
+    /---/input/<dataset-slug> -- NOT /---/input/datasets/<owner>/<slug>.
+    """
+    search_root = "/---/input"
+    if not os.path.isdir(search_root):
+        return default_path
+    try:
+        for entry in os.listdir(search_root):
+            candidate = os.path.join(search_root, entry)
+            if not os.path.isdir(candidate):
+                continue
+            try:
+                names = os.listdir(candidate)
+            except OSError:
+                continue
+            if any(n.startswith("zarr-") and n.endswith(".whl") for n in names):
+                return candidate
+    except OSError:
+        pass
+    return default_path
+
+
+CFG_OFFLINE_WHEELHOUSE = _autodetect_wheelhouse(CFG_OFFLINE_WHEELHOUSE)
+print(f"Offline wheelhouse resolved to: {CFG_OFFLINE_WHEELHOUSE} "
+      f"(exists={os.path.isdir(CFG_OFFLINE_WHEELHOUSE)})")
+
+
+def has_internet(timeout=3.0):
+    import socket
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.create_connection(("pypi.org", 443))
+        return True
+    except OSError:
+        return False
+
+
+def ensure_package(import_name, pip_name=None):
+    """Import a package, self-installing it if missing."""
+    pip_name = pip_name or import_name
+    try:
+        return importlib.import_module(import_name)
+    except ImportError:
+        pass
+
+    offline_dir = os.environ.get("OFFLINE_WHEELHOUSE", CFG_OFFLINE_WHEELHOUSE)
+    if offline_dir and os.path.isdir(offline_dir):
+        cmd = [
+            sys.executable, "-m", "pip", "install", "--quiet", "--no-index",
+            f"--find-links={offline_dir}", pip_name,
+        ]
+        try:
+            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            importlib.invalidate_caches()
+            return importlib.import_module(import_name)
+        except Exception:
+            pass
+
+    if has_internet():
+        cmd = [sys.executable, "-m", "pip", "install", "--quiet", pip_name]
+        try:
+            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            importlib.invalidate_caches()
+            return importlib.import_module(import_name)
+        except Exception:
+            pass
+
+    return None
+
+
+# NOTE: skimage is no longer required at all -- the fast local-maxima
+# detector below uses only scipy.ndimage, which removes a whole dependency
+# chain (and a whole failure mode) from the offline install path.
+zarr = ensure_package("zarr")
+scipy_ndimage_mod = ensure_package("scipy.ndimage", "scipy")
+scipy_spatial_mod = ensure_package("scipy.spatial", "scipy")
+scipy_sparse_mod = ensure_package("scipy.sparse.csgraph", "scipy")
+scipy_optimize_mod = ensure_package("scipy.optimize", "scipy")
+
+_REQUIRED = {
+    "zarr": zarr,
+    "scipy.ndimage": scipy_ndimage_mod,
+    "scipy.spatial": scipy_spatial_mod,
+    "scipy.sparse.csgraph": scipy_sparse_mod,
+    "scipy.optimize": scipy_optimize_mod,
+}
+_MISSING = [name for name, mod in _REQUIRED.items() if mod is None]
+
+if _MISSING:
+    internet_ok = has_internet()
+    wheelhouse_dir = os.environ.get("OFFLINE_WHEELHOUSE", CFG_OFFLINE_WHEELHOUSE)
+    wheelhouse_ok = bool(wheelhouse_dir) and os.path.isdir(wheelhouse_dir)
+    diagnosis = (
+        f"internet_available={internet_ok}, "
+        f"offline_wheelhouse_configured={wheelhouse_ok} (path={wheelhouse_dir})"
+    )
+    if not internet_ok and not wheelhouse_ok:
+        cause = (
+            "Internet is disabled AND no offline wheelhouse was found at "
+            f"'{wheelhouse_dir}'. Build a wheelhouse containing zarr's v3 "
+            "dependency closure (zarr, numcodecs, donfig, google-crc32c, "
+            "packaging, typing_extensions, pyyaml), attach it as a --- "
+            "Dataset, and confirm it appears under /---/input/ in this "
+            "exact notebook version."
+        )
+    elif not internet_ok and wheelhouse_ok:
+        cause = (
+            f"The offline wheelhouse at '{wheelhouse_dir}' exists but the "
+            f"install still failed for {_MISSING}. Check for a Python "
+            "version mismatch between wheel tags and this kernel."
+        )
+    else:
+        cause = (
+            f"Internet is available but the online pip install of "
+            f"{_MISSING} still failed. Re-run this cell once."
+        )
+    raise ModuleNotFoundError(
+        f"Missing required packages: {_MISSING}. Diagnosis: {diagnosis}. {cause}"
+    )
+
+import zarr
+from scipy import ndimage as ndi
+from scipy.spatial.distance import cdist
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.optimize import linear_sum_assignment
+
+try:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    _PLOTTING = True
+    sns.set_theme(style="whitegrid")
+except ImportError:
+    _PLOTTING = False
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+print("Environment ready.")
+print(f"numpy={np.__version__} pandas={pd.__version__} zarr={zarr.__version__}")
+
+
+# ------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------------
+class CFG:
+    CANDIDATE_ROOTS = [
+        "/---/input/competitions/biohub-cell-tracking-during-development",
+        "/---/input/biohub-cell-tracking-during-development",
+    ]
+    OUTPUT_DIR = "/---/working"
+    SUBMISSION_PATH = os.path.join(OUTPUT_DIR, "submission.csv")
+
+    # --- Physical scale (from competition metric description) --------
+    Z_SCALE_UM = 1.625
+    Y_SCALE_UM = 0.40625
+    X_SCALE_UM = 0.40625
+    MAX_LINK_DIST_UM = 7.0
+    DIVISION_SEARCH_DIST_UM = 7.0
+
+    # --- Detection -----------------------------------------------------
+    GAUSSIAN_SIGMA = 1.0
+    MIN_DISTANCE_VOXELS = 3
+    INTENSITY_PERCENTILE = 99.0
+    MAX_DETECTIONS_PER_FRAME = 4000
+
+    # --- Speed / accuracy tradeoff knobs (new) --------------------------
+    # Percentile thresholds are computed on a random subsample of voxels
+    # instead of the full volume. 500k voxels gives a stable percentile
+    # estimate even for large 3D frames while being ~cheap to sort.
+    PERCENTILE_SUBSAMPLE = 500_000
+
+    # --- Parallelism (new) ----------------------------------------------
+    # Datasets are independent, so process several in parallel. Leave one
+    # core free for the main process / I/O. Lower this if you hit ---'s
+    # memory ceiling with multiple large volumes loaded at once.
+    MAX_WORKERS = max(1, (os.cpu_count() or 2) - 1)
+
+    # --- Runtime / memory safety -----------------------------------------
+    TIME_BUDGET_SECONDS = 8.0 * 3600
+    MAX_FRAMES_PER_DATASET = None
+    DTYPE = np.float32
+
+    # --- EDA -------------------------------------------------------------
+    N_DATASETS_TO_PREVIEW = 3
+    RANDOM_SEED = 42
+
+
+np.random.seed(CFG.RANDOM_SEED)
+
+
+def resolve_data_root(candidates):
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    raise FileNotFoundError(
+        "Could not find the competition data directory. Tried:\n"
+        + "\n".join(f" - {c}" for c in candidates)
+        + "\nPlease verify the dataset is attached to this notebook and "
+          "update CFG.CANDIDATE_ROOTS if the mount path differs."
+    )
+
+
+DATA_ROOT = resolve_data_root(CFG.CANDIDATE_ROOTS)
+os.makedirs(CFG.OUTPUT_DIR, exist_ok=True)
+print(f"Using data root: {DATA_ROOT}")
+
+
+# ---------------------------------------------------------
+# Dataset discovery utilities
+# -------------------------------------------------------------------------
+def list_dir_safe(path):
+    try:
+        return sorted(os.listdir(path))
+    except (FileNotFoundError, PermissionError):
+        return []
+
+
+def find_split_dir(root, split_names=("test", "Test", "TEST")):
+    for name in split_names:
+        candidate = os.path.join(root, name)
+        if os.path.isdir(candidate):
+            return candidate
+    return root
+
+
+def discover_zarr_datasets(split_dir):
+    entries = list_dir_safe(split_dir)
+    datasets = {}
+    for e in entries:
+        full = os.path.join(split_dir, e)
+        if e.endswith(".zarr") and (os.path.isdir(full) or os.path.isfile(full)):
+            dataset_id = e[: -len(".zarr")]
+            datasets[dataset_id] = full
+    return datasets
+
+
+print("Top-level contents of DATA_ROOT:")
+for item in list_dir_safe(DATA_ROOT):
+    print(f" - {item}")
+
+TEST_DIR = find_split_dir(DATA_ROOT, ("test", "Test", "TEST"))
+TRAIN_DIR = find_split_dir(DATA_ROOT, ("train", "Train", "TRAIN"))
+
+TEST_DATASETS = discover_zarr_datasets(TEST_DIR)
+TRAIN_DATASETS = discover_zarr_datasets(TRAIN_DIR) if TRAIN_DIR != TEST_DIR else {}
+
+print(f"\nTest dir resolved to : {TEST_DIR}")
+print(f"Found {len(TEST_DATASETS)} test datasets: {list(TEST_DATASETS.keys())}")
+if TRAIN_DATASETS:
+    print(f"Found {len(TRAIN_DATASETS)} train datasets: {list(TRAIN_DATASETS.keys())}")
+
+if not TEST_DATASETS:
+    raise FileNotFoundError(
+        f"No .zarr datasets discovered under '{TEST_DIR}'. Inspect the "
+        f"directory tree manually (e.g. `!find {DATA_ROOT} -maxdepth 3`) "
+        f"and update `find_split_dir` / `discover_zarr_datasets` accordingly."
+    )
+
+
+# ------------------------------------------------------------
+# zarr array access
+# -------------------------------------------------------------------------
+def open_zarr_image(path):
+    """Open a .zarr path and return a lazy array-like object with shape
+    (T, Z, Y, X) -- squeezing a channel axis if present."""
+    z = zarr.open(path, mode="r")
+
+    if isinstance(z, zarr.Array):
+        arr = z
+    else:
+        candidate_keys = ["0", "raw", "image", "data", "intensities"]
+        arr = None
+        for k in candidate_keys:
+            if k in z:
+                node = z[k]
+                if isinstance(node, zarr.Array):
+                    arr = node
+                    break
+        if arr is None:
+            for _, node in z.arrays(recurse=True):
+                arr = node
+                break
+        if arr is None:
+            raise ValueError(f"Could not locate an image array inside {path}")
+
+    if arr.ndim == 5:
+        return arr, True
+    elif arr.ndim == 4:
+        return arr, False
+    else:
+        raise ValueError(
+            f"Unexpected array shape {arr.shape} for {path}; expected 4D "
+            f"(T,Z,Y,X) or 5D (T,C,Z,Y,X)."
+        )
+
+
+def get_frame(arr, has_channel, t):
+    frame = arr[t, 0] if has_channel else arr[t]
+    return np.asarray(frame, dtype=CFG.DTYPE)
+
+
+# -----------------------------------------------------------
+# EDA: dataset shapes/dtypes and a couple of visual previews
+# -------------------------------------------------------------------------
+eda_rows = []
+for ds_id, path in TEST_DATASETS.items():
+    try:
+        arr, has_ch = open_zarr_image(path)
+        t, z, y, x = (arr.shape[0], arr.shape[-3], arr.shape[-2], arr.shape[-1])
+        eda_rows.append({
+            "dataset": ds_id, "split": "test", "n_frames": t,
+            "z": z, "y": y, "x": x, "dtype": str(arr.dtype),
+            "chunks": str(arr.chunks),
+        })
+    except Exception as exc:
+        print(f"[WARN] Could not inspect test dataset {ds_id}: {exc}")
+
+for ds_id, path in TRAIN_DATASETS.items():
+    try:
+        arr, has_ch = open_zarr_image(path)
+        t, z, y, x = (arr.shape[0], arr.shape[-3], arr.shape[-2], arr.shape[-1])
+        eda_rows.append({
+            "dataset": ds_id, "split": "train", "n_frames": t,
+            "z": z, "y": y, "x": x, "dtype": str(arr.dtype),
+            "chunks": str(arr.chunks),
+        })
+    except Exception as exc:
+        print(f"[WARN] Could not inspect train dataset {ds_id}: {exc}")
+
+eda_df = pd.DataFrame(eda_rows)
+print(eda_df.to_string(index=False))
+
+if _PLOTTING and not eda_df.empty:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    sns.barplot(data=eda_df, x="dataset", y="n_frames", hue="split", ax=axes[0])
+    axes[0].set_title("Number of timepoints per dataset")
+    axes[0].tick_params(axis="x", rotation=45)
+
+    vol_df = eda_df.assign(volume_voxels=lambda d: d.z * d.y * d.x)
+    sns.barplot(data=vol_df, x="dataset", y="volume_voxels", hue="split", ax=axes[1])
+    axes[1].set_title("Volume size per frame (voxels)")
+    axes[1].tick_params(axis="x", rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(CFG.OUTPUT_DIR, "eda_dataset_shapes.png"), dpi=120)
+    plt.show()
+
+    preview_ids = list(TEST_DATASETS.keys())[: CFG.N_DATASETS_TO_PREVIEW]
+    fig, axes = plt.subplots(len(preview_ids), 2, figsize=(10, 4 * len(preview_ids)))
+    axes = np.atleast_2d(axes)
+    for i, ds_id in enumerate(preview_ids):
+        try:
+            arr, has_ch = open_zarr_image(TEST_DATASETS[ds_id])
+            frame = get_frame(arr, has_ch, t=0)
+            mid_z = frame.shape[0] // 2
+            axes[i, 0].imshow(frame[mid_z], cmap="gray")
+            axes[i, 0].set_title(f"{ds_id} | t=0, z={mid_z} (mid slice)")
+            axes[i, 0].axis("off")
+
+            sample = frame.ravel()
+            if sample.size > 200_000:
+                sample = np.random.choice(sample, 200_000, replace=False)
+            axes[i, 1].hist(sample, bins=80, color="steelblue")
+            axes[i, 1].set_title(f"{ds_id} intensity distribution (t=0)")
+            del frame, sample
+        except Exception as exc:
+            print(f"[WARN] Preview failed for {ds_id}: {exc}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(CFG.OUTPUT_DIR, "eda_intensity_previews.png"), dpi=120)
+    plt.show()
+    gc.collect()
+else:
+    print("Plotting libraries unavailable or no datasets found; skipping visual EDA.")
+
+
+# ----------------------------------------------------------
+# Preprocessing + detection 
+# -------------------------------------------------------------------------
+def _percentile_subsampled(arr, pct, max_samples=CFG.PERCENTILE_SUBSAMPLE):
+    """Percentile estimate from a random subsample instead of the full
+    array. For a large 3D volume this turns an O(n log n) sort over
+    millions of voxels into one over a few hundred thousand, with
+    negligible change to the estimated percentile."""
+    flat = arr.ravel()
+    if flat.size > max_samples:
+        idx = np.random.choice(flat.size, max_samples, replace=False)
+        sample = flat[idx]
+    else:
+        sample = flat
+    return np.percentile(sample, pct)
+
+
+def preprocess_frame(frame):
+    """Denoise and normalize a single (Z,Y,X) frame.
+
+    Uses scipy.ndimage.gaussian_filter instead of skimage.filters.gaussian:
+    functionally equivalent for our purposes but with lower call overhead,
+    which adds up over thousands of frame x dataset calls.
+    """
+    frame = frame.astype(CFG.DTYPE, copy=False)
+    smoothed = ndi.gaussian_filter(frame, sigma=CFG.GAUSSIAN_SIGMA)
+    lo, hi = np.percentile(
+        smoothed.ravel()[:: max(1, smoothed.size // CFG.PERCENTILE_SUBSAMPLE)],
+        [1, 99.5],
+    )
+    if hi - lo < 1e-6:
+        return smoothed.astype(CFG.DTYPE)
+    smoothed = np.clip((smoothed - lo) / (hi - lo), 0, 1)
+    return smoothed.astype(CFG.DTYPE)
+
+
+def detect_centroids(frame_smoothed):
+    """Detect local-maxima blob centroids in a preprocessed (Z,Y,X) frame.
+    Returns an (N,3) array of integer (z,y,x) voxel coordinates.
+
+    Replaces skimage.feature.peak_local_max with a scipy.ndimage
+    maximum_filter based local-max mask. This is the single biggest
+    per-frame speedup in this script: peak_local_max carries a lot of
+    overhead (internal labeling / border handling) that isn't needed here
+    since we already threshold and cap detections ourselves.
+    """
+    if not np.isfinite(frame_smoothed).all() or frame_smoothed.max() <= 0:
+        return np.empty((0, 3), dtype=np.int32)
+
+    threshold_abs = _percentile_subsampled(frame_smoothed, CFG.INTENSITY_PERCENTILE)
+    threshold_abs = max(threshold_abs, 1e-4)
+
+    size = 2 * CFG.MIN_DISTANCE_VOXELS + 1
+    local_max = frame_smoothed == ndi.maximum_filter(
+        frame_smoothed, size=size, mode="nearest"
+    )
+    local_max &= frame_smoothed > threshold_abs
+
+    coords = np.argwhere(local_max)
+
+    if len(coords) > CFG.MAX_DETECTIONS_PER_FRAME:
+        vals = frame_smoothed[tuple(coords.T)]
+        # argpartition (O(n)) instead of a full argsort (O(n log n)) since
+        # we only need the top-K, not a full ranking.
+        top_idx = np.argpartition(vals, -CFG.MAX_DETECTIONS_PER_FRAME)[
+            -CFG.MAX_DETECTIONS_PER_FRAME:
+        ]
+        coords = coords[top_idx]
+
+    return coords.astype(np.int32)
+
+
+# -----------------------------------------------------------
+# Frame-to-frame linking (OPTIMIZED: sparse candidate graph +
+# per-connected-component Hungarian assignment)
+# -------------------------------------------------------------------------
+SCALE = np.array([CFG.Z_SCALE_UM, CFG.Y_SCALE_UM, CFG.X_SCALE_UM], dtype=np.float64)
+
+
+def to_physical(coords_voxel):
+    return coords_voxel.astype(np.float64) * SCALE
+
+
+def link_frames(coords_prev_um, coords_next_um):
+    """Return list of (i_prev, i_next) index pairs linking two frames,
+    allowing at most 2 daughters per parent (division-aware).
+
+    The original implementation ran one dense linear_sum_assignment over
+    an (n_prev x n_next) cost matrix every frame pair -- with thousands of
+    detections per frame that's an O(n^3)-ish solve, repeated hundreds of
+    times, and it dominates total runtime.
+
+    This version instead:
+      1. Uses a KD-tree to find only the next-frame points within linking
+         range of each prev-frame point (most points have zero or a
+         handful of candidates, not thousands).
+      2. Splits the resulting sparse bipartite candidate graph into
+         connected components via union-find (scipy connected_components).
+      3. Runs Hungarian assignment independently on each (typically tiny,
+         size 1-5) component instead of once on the full matrix.
+
+    The math (min-cost bipartite matching within MAX_LINK_DIST_UM, plus a
+    division pass within DIVISION_SEARCH_DIST_UM) is identical to before;
+    only the amount of wasted computation changes.
+    """
+    n_prev, n_next = len(coords_prev_um), len(coords_next_um)
+    if n_prev == 0 or n_next == 0:
+        return []
+
+    radius = max(CFG.MAX_LINK_DIST_UM, CFG.DIVISION_SEARCH_DIST_UM)
+    tree_next = cKDTree(coords_next_um)
+    candidate_lists = tree_next.query_ball_point(coords_prev_um, r=radius)
+
+    rows, cols = [], []
+    for i, neighbors in enumerate(candidate_lists):
+        for j in neighbors:
+            rows.append(i)
+            cols.append(j)
+
+    if not rows:
+        return []
+
+    rows = np.asarray(rows)
+    cols = np.asarray(cols)
+
+    n_total = n_prev + n_next
+    graph = coo_matrix(
+        (np.ones(len(rows)), (rows, cols + n_prev)), shape=(n_total, n_total)
+    )
+    n_comp, labels = connected_components(graph, directed=False)
+
+    prev_labels = labels[:n_prev]
+    next_labels = labels[n_prev:]
+
+    links = []
+    for comp_id in range(n_comp):
+        prev_idx = np.where(prev_labels == comp_id)[0]
+        next_idx = np.where(next_labels == comp_id)[0]
+        if len(prev_idx) == 0 or len(next_idx) == 0:
+            continue  # isolated node with no candidates in range
+
+        if len(prev_idx) == 1 and len(next_idx) == 1:
+            d = cdist(coords_prev_um[prev_idx], coords_next_um[next_idx])[0, 0]
+            if d <= CFG.MAX_LINK_DIST_UM:
+                links.append((int(prev_idx[0]), int(next_idx[0])))
+            continue
+
+        sub_prev = coords_prev_um[prev_idx]
+        sub_next = coords_next_um[next_idx]
+        sub_dist = cdist(sub_prev, sub_next)
+        sub_cost = np.where(sub_dist <= CFG.MAX_LINK_DIST_UM, sub_dist, 1e6)
+
+        r_ind, c_ind = linear_sum_assignment(sub_cost)
+        matched_next_local = set()
+        child_count_local = {k: 0 for k in range(len(prev_idx))}
+        for r, c in zip(r_ind, c_ind):
+            if sub_cost[r, c] < 1e6:
+                links.append((int(prev_idx[r]), int(next_idx[c])))
+                matched_next_local.add(c)
+                child_count_local[r] += 1
+
+        unmatched_next_local = [
+            c for c in range(len(next_idx)) if c not in matched_next_local
+        ]
+        for c in unmatched_next_local:
+            candidate_parents = [
+                r for r in range(len(prev_idx)) if child_count_local[r] < 2
+            ]
+            if not candidate_parents:
+                continue
+            d_to_candidates = sub_dist[candidate_parents, c]
+            best_local = int(np.argmin(d_to_candidates))
+            best_dist = d_to_candidates[best_local]
+            if best_dist <= CFG.DIVISION_SEARCH_DIST_UM:
+                best_parent = candidate_parents[best_local]
+                links.append((int(prev_idx[best_parent]), int(next_idx[c])))
+                child_count_local[best_parent] += 1
+
+    return links
+
+
+# ------------------------------------------------------------
+#  detect + track across a single dataset
+# -------------------------------------------------------------------------
+def process_dataset(dataset_id, zarr_path, deadline_ts):
+    """Returns (node_rows, edge_rows) as lists of dicts for one dataset.
+    Always returns at least an empty structure -- never raises -- so the
+    caller can guarantee every required dataset appears in the submission.
+    """
+    node_rows, edge_rows = [], []
+    try:
+        arr, has_channel = open_zarr_image(zarr_path)
+        n_frames = arr.shape[0]
+        if CFG.MAX_FRAMES_PER_DATASET is not None:
+            n_frames = min(n_frames, CFG.MAX_FRAMES_PER_DATASET)
+
+        node_id_counter = 1
+        prev_coords_voxel = None
+        prev_node_ids = None
+
+        for t in range(n_frames):
+            if time.time() > deadline_ts:
+                print(f"[WARN] Time budget exceeded during '{dataset_id}' "
+                      f"at t={t}/{n_frames}; truncating remaining frames.")
+                break
+
+            frame = get_frame(arr, has_channel, t)
+            frame_proc = preprocess_frame(frame)
+            coords_voxel = detect_centroids(frame_proc)
+            del frame, frame_proc
+
+            cur_node_ids = []
+            for (z, y, x) in coords_voxel:
+                node_rows.append({
+                    "dataset": dataset_id, "row_type": "node",
+                    "node_id": node_id_counter, "t": int(t),
+                    "z": int(z), "y": int(y), "x": int(x),
+                    "source_id": -1, "target_id": -1,
+                })
+                cur_node_ids.append(node_id_counter)
+                node_id_counter += 1
+
+            if prev_coords_voxel is not None and len(prev_coords_voxel) and len(coords_voxel):
+                prev_um = to_physical(prev_coords_voxel)
+                cur_um = to_physical(coords_voxel)
+                links = link_frames(prev_um, cur_um)
+                for i_prev, i_cur in links:
+                    edge_rows.append({
+                        "dataset": dataset_id, "row_type": "edge",
+                        "node_id": -1, "t": -1, "z": -1, "y": -1, "x": -1,
+                        "source_id": prev_node_ids[i_prev],
+                        "target_id": cur_node_ids[i_cur],
+                    })
+
+            prev_coords_voxel = coords_voxel
+            prev_node_ids = cur_node_ids
+
+        del arr
+        gc.collect()
+
+    except Exception as exc:
+        print(f"[ERROR] Dataset '{dataset_id}' failed: {exc}")
+        traceback.print_exc()
+        if not node_rows:
+            node_rows.append({
+                "dataset": dataset_id, "row_type": "node", "node_id": 1,
+                "t": 0, "z": 0, "y": 0, "x": 0,
+                "source_id": -1, "target_id": -1,
+            })
+
+    return node_rows, edge_rows
+
+
+def _process_dataset_worker(args):
+    """Top-level (picklable) wrapper so process_dataset can be dispatched
+    to a ProcessPoolExecutor."""
+    ds_id, path, deadline_ts = args
+    ds_start = time.time()
+    nodes, edges = process_dataset(ds_id, path, deadline_ts)
+    return ds_id, nodes, edges, time.time() - ds_start
+
+
+# ----------------------------------------------------------
+# Run the pipeline over all test datasets (OPTIMIZED: parallel across
+# datasets, since each dataset is fully independent work).
+# -------------------------------------------------------------------------
+start_ts = time.time()
+deadline_ts = start_ts + CFG.TIME_BUDGET_SECONDS
+
+all_node_rows, all_edge_rows = [], []
+summary = []
+
+tasks = [(ds_id, path, deadline_ts) for ds_id, path in TEST_DATASETS.items()]
+n_workers = min(CFG.MAX_WORKERS, len(tasks))
+print(f"Processing {len(tasks)} test dataset(s) with {n_workers} worker process(es).")
+
+if n_workers <= 1:
+    # Fall back to sequential execution (also useful for debugging, since
+    # tracebacks from a single process are easier to read).
+    for ds_id, path, dl in tqdm(tasks, desc="Processing test datasets"):
+        _, nodes, edges, secs = _process_dataset_worker((ds_id, path, dl))
+        all_node_rows.extend(nodes)
+        all_edge_rows.extend(edges)
+        summary.append({
+            "dataset": ds_id, "n_nodes": len(nodes), "n_edges": len(edges),
+            "seconds": round(secs, 1),
+        })
+        gc.collect()
+else:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_process_dataset_worker, t): t[0] for t in tasks}
+        for fut in tqdm(
+            concurrent.futures.as_completed(futures),
+            total=len(futures),
+            desc="Processing test datasets (parallel)",
+        ):
+            ds_id = futures[fut]
+            try:
+                _, nodes, edges, secs = fut.result()
+            except Exception as exc:
+                print(f"[ERROR] Worker for '{ds_id}' crashed: {exc}")
+                nodes, edges, secs = (
+                    [{
+                        "dataset": ds_id, "row_type": "node", "node_id": 1,
+                        "t": 0, "z": 0, "y": 0, "x": 0,
+                        "source_id": -1, "target_id": -1,
+                    }],
+                    [],
+                    0.0,
+                )
+            all_node_rows.extend(nodes)
+            all_edge_rows.extend(edges)
+            summary.append({
+                "dataset": ds_id, "n_nodes": len(nodes), "n_edges": len(edges),
+                "seconds": round(secs, 1),
+            })
+
+summary_df = pd.DataFrame(summary)
+print(summary_df.to_string(index=False))
+print(f"\nTotal runtime so far: {(time.time() - start_ts) / 60:.1f} minutes")
+
+if _PLOTTING and not summary_df.empty:
+    fig, ax = plt.subplots(figsize=(8, 4))
+    sns.barplot(data=summary_df, x="dataset", y="n_nodes", ax=ax, color="steelblue")
+    ax.set_title("Detected nodes per test dataset")
+    ax.tick_params(axis="x", rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(CFG.OUTPUT_DIR, "detections_per_dataset.png"), dpi=120)
+    plt.show()
+
+
+# ---------------------------------------------------------
+# Assemble and validate the submission file
+# -------------------------------------------------------------------------
+REQUIRED_COLUMNS = [
+    "id", "dataset", "row_type", "node_id", "t", "z", "y", "x",
+    "source_id", "target_id",
+]
+
+
+def build_submission(node_rows, edge_rows, expected_datasets):
+    rows = node_rows + edge_rows
+    if not rows:
+        raise ValueError("No rows were generated; cannot build submission.")
+
+    df = pd.DataFrame(rows)
+
+    missing = set(expected_datasets) - set(df["dataset"].unique())
+    for ds_id in missing:
+        print(f"[WARN] Dataset '{ds_id}' had no rows; inserting placeholder node.")
+        df = pd.concat([df, pd.DataFrame([{
+            "dataset": ds_id, "row_type": "node", "node_id": 1,
+            "t": 0, "z": 0, "y": 0, "x": 0, "source_id": -1, "target_id": -1,
+        }])], ignore_index=True)
+
+    df.insert(0, "id", range(len(df)))
+
+    int_cols = ["id", "node_id", "t", "z", "y", "x", "source_id", "target_id"]
+    for c in int_cols:
+        df[c] = df[c].fillna(-1).astype(np.int64)
+
+    df = df[REQUIRED_COLUMNS]
+    return df
+
+
+def validate_submission(df, expected_datasets):
+    errs = []
+    if list(df.columns) != REQUIRED_COLUMNS:
+        errs.append(f"Column mismatch: {list(df.columns)}")
+    if set(df["row_type"].unique()) - {"node", "edge"}:
+        errs.append("Unexpected row_type values found.")
+    missing = set(expected_datasets) - set(df["dataset"].unique())
+    if missing:
+        errs.append(f"Missing required datasets: {missing}")
+    if df[int_cols_check].isna().any().any():
+        errs.append("NaN values present in numeric columns.")
+    if not df["id"].equals(pd.Series(range(len(df)))):
+        errs.append("id column is not a consecutive integer index.")
+    return errs
+
+
+int_cols_check = ["id", "node_id", "t", "z", "y", "x", "source_id", "target_id"]
+
+submission_df = build_submission(all_node_rows, all_edge_rows, TEST_DATASETS.keys())
+validation_errors = validate_submission(submission_df, TEST_DATASETS.keys())
+
+if validation_errors:
+    raise ValueError("Submission validation failed:\n" + "\n".join(validation_errors))
+
+print(f"Submission shape: {submission_df.shape}")
+print(submission_df.head(10).to_string(index=False))
+
+submission_df.to_csv(CFG.SUBMISSION_PATH, index=False)
+print(f"\nSaved submission to: {CFG.SUBMISSION_PATH}")
+print(f"Total runtime: {(time.time() - start_ts) / 60:.1f} minutes")
