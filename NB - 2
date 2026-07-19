@@ -479,8 +479,7 @@ def detect_centroids(frame_smoothed):
 
 
 # -----------------------------------------------------------
-# Frame-to-frame linking (OPTIMIZED: sparse candidate graph +
-# per-connected-component Hungarian assignment)
+# Frame-to-frame linking 
 # -------------------------------------------------------------------------
 SCALE = np.array([CFG.Z_SCALE_UM, CFG.Y_SCALE_UM, CFG.X_SCALE_UM], dtype=np.float64)
 
