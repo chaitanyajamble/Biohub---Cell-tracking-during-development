@@ -1,0 +1,695 @@
+# ------------------------------------------------------------
+# Imports and environment setup
+# -------------------------------------------------------------------------
+import os
+import gc
+import sys
+import time
+import json
+import warnings
+import traceback
+import importlib
+import subprocess
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+CFG_OFFLINE_WHEELHOUSE = "download/chaitanyajamble/zarr-offline-wheels"
+
+
+
+def _autodetect_wheelhouse(default_path):
+    """Scan /download/*/ for a folder that actually contains the zarr
+    wheel, since the exact mounted dataset-folder name can differ from
+    what you'd expect from the dataset .
+
+    IMPORTANT:  Attached dataset inside a notebook at
+    /download/<dataset> .
+    The latter is only the *website* URL for the dataset's page; it is not
+    a real path inside the notebook's filesystem, so searching there always
+    came back empty and silently fell through to the (also malformed,
+    non-absolute) default_path. That is what broke offline installs during
+    the actual (internet-disabled) submission rerun even though the
+    notebook could still reach PyPI -- and therefore looked fine -- while
+    editing interactively with internet enabled.
+    """
+    search_root = "/download/--"
+    if not os.path.isdir(search_root):
+        return default_path
+    try:
+        for entry in os.listdir(search_root):
+            candidate = os.path.join(search_root, entry)
+            if not os.path.isdir(candidate):
+                continue
+            try:
+                names = os.listdir(candidate)
+            except OSError:
+                continue
+            if any(n.startswith("zarr-") and n.endswith(".whl") for n in names):
+                return candidate
+    except OSError:
+        pass
+    return default_path
+
+
+CFG_OFFLINE_WHEELHOUSE = _autodetect_wheelhouse(CFG_OFFLINE_WHEELHOUSE)
+print(f"Offline wheelhouse resolved to: {CFG_OFFLINE_WHEELHOUSE} "
+      f"(exists={os.path.isdir(CFG_OFFLINE_WHEELHOUSE)})")
+
+
+def has_internet(timeout=3.0):
+    """Cheap connectivity probe so error messages can state the real cause
+    instead of guessing."""
+    import socket
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.create_connection(("pypi.org", 443))
+        return True
+    except OSError:
+        return False
+
+
+def ensure_package(import_name, pip_name=None):
+    """Import a package, self-installing it if missing.
+
+    Install order:
+      1. Plain `import` (covers packages already preinstalled in the image).
+      2. Offline wheelhouse install, if CFG_OFFLINE_WHEELHOUSE exists (this
+         is what lets the final, internet-disabled submission run succeed).
+      3. Regular online `pip install` (only works while internet is
+         enabled, i.e. during interactive development, not at submission
+         time).
+
+    Returns the imported module, or None if every strategy failed.
+    """
+    pip_name = pip_name or import_name
+    try:
+        return importlib.import_module(import_name)
+    except ImportError:
+        pass
+
+    offline_dir = os.environ.get("OFFLINE_WHEELHOUSE", CFG_OFFLINE_WHEELHOUSE)
+    if offline_dir and os.path.isdir(offline_dir):
+        cmd = [
+            sys.executable, "-m", "pip", "install", "--quiet", "--no-index",
+            f"--find-links={offline_dir}", pip_name,
+        ]
+        try:
+            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            importlib.invalidate_caches()
+            return importlib.import_module(import_name)
+        except Exception:
+            pass
+
+    if has_internet():
+        cmd = [sys.executable, "-m", "pip", "install", "--quiet", pip_name]
+        try:
+            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            importlib.invalidate_caches()
+            return importlib.import_module(import_name)
+        except Exception:
+            pass
+
+    return None
+
+
+zarr = ensure_package("zarr")
+scipy_ndimage_mod = ensure_package("scipy.ndimage", "scipy")
+scipy_spatial_mod = ensure_package("scipy.spatial.distance", "scipy")
+scipy_optimize_mod = ensure_package("scipy.optimize", "scipy")
+skimage_feature_mod = ensure_package("skimage.feature", "scikit-image")
+skimage_filters_mod = ensure_package("skimage.filters", "scikit-image")
+
+_REQUIRED = {
+    "zarr": zarr,
+    "scipy.ndimage": scipy_ndimage_mod,
+    "scipy.spatial.distance": scipy_spatial_mod,
+    "scipy.optimize": scipy_optimize_mod,
+    "skimage.feature": skimage_feature_mod,
+    "skimage.filters": skimage_filters_mod,
+}
+_MISSING = [name for name, mod in _REQUIRED.items() if mod is None]
+
+if _MISSING:
+    internet_ok = has_internet()
+    wheelhouse_dir = os.environ.get("OFFLINE_WHEELHOUSE", CFG_OFFLINE_WHEELHOUSE)
+    wheelhouse_ok = bool(wheelhouse_dir) and os.path.isdir(wheelhouse_dir)
+    diagnosis = (
+        f"internet_available={internet_ok}, "
+        f"offline_wheelhouse_configured={wheelhouse_ok} (path={wheelhouse_dir})"
+    )
+    if not internet_ok and not wheelhouse_ok:
+        cause = (
+            "If no offline wheelhouse was found at "
+            f"'{wheelhouse_dir}'. This is expected for a Code Competition "
+            "submission run. Fix: build zarr_offline_wheels.zip containing "
+            "cp312-manylinux .whl files for zarr's actual v3 dependency "
+            "closure -- zarr, numcodecs, donfig, google-crc32c, packaging, "
+            "typing_extensions, pyyaml (NOT the old zarr-v2 deps like "
+            "asciitree/fasteners/deprecated/wrapt, which zarr 3.x no "
+            "longer needs), upload it as a --- Dataset (New Dataset -> "
+            "Upload -> the zip; --- extracts it automatically), "
+            "'+ Add Data' that dataset to this notebook, and confirm it "
+            "actually appears under /---/input/<your-dataset-slug> in "
+            "this notebook's file browser -- attaching it to a different "
+            "version/session than the one you submit will not carry over."
+        )
+    elif not internet_ok and wheelhouse_ok:
+        cause = (
+            f"The offline wheelhouse at '{wheelhouse_dir}' exists but the "
+            f"install still failed for {_MISSING}. Likely a Python-version "
+            "mismatch between the wheel filenames (e.g. cp311 vs cp312) "
+            "and this kernel's interpreter, or a missing transitive "
+            "dependency. Check `import sys; print(sys.version)` and make "
+            "sure a wheel tagged for that exact version is in the "
+            "wheelhouse."
+        )
+    else:
+        cause = (
+            f"Internet is available but the online pip install of "
+            f"{_MISSING} still failed. Re-run this cell once (transient "
+            "network hiccup), or check the full pip error by running "
+            f"`!pip install {' '.join(_MISSING)}` directly in a cell."
+        )
+    raise ModuleNotFoundError(
+        f"Missing required packages: {_MISSING}. Diagnosis: {diagnosis}. {cause}"
+    )
+
+import zarr
+from scipy import ndimage as ndi
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
+from skimage.feature import peak_local_max
+from skimage.filters import gaussian
+
+try:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    _PLOTTING = True
+    sns.set_theme(style="whitegrid")
+except ImportError:
+    _PLOTTING = False
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+print("Environment ready.")
+print(f"numpy={np.__version__} pandas={pd.__version__} zarr={zarr.__version__}")
+
+
+# ------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------------
+class CFG:
+    # --- Paths -------------------------------------------------------
+   
+    CANDIDATE_ROOTS = [
+        "/---/input/competitions/biohub-cell-tracking-during-development",
+        "/---/input/biohub-cell-tracking-during-development",
+    ]
+    OUTPUT_DIR = "/working/---"
+    SUBMISSION_PATH = os.path.join(OUTPUT_DIR, "submission.csv")
+
+    # --- Physical scale (from competition metric description) --------
+    Z_SCALE_UM = 1.625
+    Y_SCALE_UM = 0.40625
+    X_SCALE_UM = 0.40625
+    MAX_LINK_DIST_UM = 7.0 # max centroid distance for a valid edge
+    DIVISION_SEARCH_DIST_UM = 7.0 # max distance to accept a 2nd daughter
+
+    # --- Detection -----------------------------------------------------
+    GAUSSIAN_SIGMA = 1.0 # denoising sigma, in voxels
+    MIN_DISTANCE_VOXELS = 3 # min separation between detected peaks
+    INTENSITY_PERCENTILE = 99.0 # peaks must exceed this percentile
+    MAX_DETECTIONS_PER_FRAME = 4000 # safety cap to bound runtime/memory
+
+
+    TIME_BUDGET_SECONDS = 8.0 * 3600 # stay comfortably under a 9h cap
+    MAX_FRAMES_PER_DATASET = None # set an int to cap frames while testing
+    DTYPE = np.float32
+
+    # --- EDA -------------------------------------------------------------
+    N_DATASETS_TO_PREVIEW = 3
+    RANDOM_SEED = 42
+
+
+np.random.seed(CFG.RANDOM_SEED)
+
+
+def resolve_data_root(candidates):
+    """Return the first existing candidate root, else raise a clear error."""
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    raise FileNotFoundError(
+        "Could not find the competition data directory. Tried:\n"
+        + "\n".join(f" - {c}" for c in candidates)
+        + "\nPlease verify the dataset is attached to this notebook and "
+          "update CFG.CANDIDATE_ROOTS if the mount path differs."
+    )
+
+
+DATA_ROOT = resolve_data_root(CFG.CANDIDATE_ROOTS)
+os.makedirs(CFG.OUTPUT_DIR, exist_ok=True)
+print(f"Using data root: {DATA_ROOT}")
+
+
+# ---------------------------------------------------------
+# Dataset discovery utilities
+# -------------------------------------------------------------------------
+def list_dir_safe(path):
+    try:
+        return sorted(os.listdir(path))
+    except (FileNotFoundError, PermissionError):
+        return []
+
+
+def find_split_dir(root, split_names=("test", "Test", "TEST")):
+    """Locate the folder holding the test .zarr volumes."""
+    for name in split_names:
+        candidate = os.path.join(root, name)
+        if os.path.isdir(candidate):
+            return candidate
+    return root # fall back to root if there is no explicit split folder
+
+
+def discover_zarr_datasets(split_dir):
+    """Return {dataset_id: full_path_to_zarr} for every .zarr entry found."""
+    entries = list_dir_safe(split_dir)
+    datasets = {}
+    for e in entries:
+        full = os.path.join(split_dir, e)
+        if e.endswith(".zarr") and (os.path.isdir(full) or os.path.isfile(full)):
+            dataset_id = e[: -len(".zarr")]
+            datasets[dataset_id] = full
+    return datasets
+
+
+print("Top-level contents of DATA_ROOT:")
+for item in list_dir_safe(DATA_ROOT):
+    print(f" - {item}")
+
+TEST_DIR = find_split_dir(DATA_ROOT, ("test", "Test", "TEST"))
+TRAIN_DIR = find_split_dir(DATA_ROOT, ("train", "Train", "TRAIN"))
+
+TEST_DATASETS = discover_zarr_datasets(TEST_DIR)
+TRAIN_DATASETS = discover_zarr_datasets(TRAIN_DIR) if TRAIN_DIR != TEST_DIR else {}
+
+print(f"\nTest dir resolved to : {TEST_DIR}")
+print(f"Found {len(TEST_DATASETS)} test datasets: {list(TEST_DATASETS.keys())}")
+if TRAIN_DATASETS:
+    print(f"Found {len(TRAIN_DATASETS)} train datasets: {list(TRAIN_DATASETS.keys())}")
+
+if not TEST_DATASETS:
+    raise FileNotFoundError(
+        f"No .zarr datasets discovered under '{TEST_DIR}'. Inspect the "
+        f"directory tree manually (e.g. `!find {DATA_ROOT} -maxdepth 3`) "
+        f"and update `find_split_dir` / `discover_zarr_datasets` accordingly."
+    )
+
+
+#------------------------------------------------------------
+# zarr array access 
+# -------------------------------------------------------------------------
+def open_zarr_image(path):
+    """Open a .zarr path and return a lazy array-like object with shape
+    (T, Z, Y, X) — squeezing a channel axis if present."""
+    z = zarr.open(path, mode="r")
+
+    if isinstance(z, zarr.Array):
+        arr = z
+    else:
+        # It's a group: try common keys, else grab the first array found.
+        candidate_keys = ["0", "raw", "image", "data", "intensities"]
+        arr = None
+        for k in candidate_keys:
+            if k in z:
+                node = z[k]
+                if isinstance(node, zarr.Array):
+                    arr = node
+                    break
+        if arr is None:
+            for _, node in z.arrays(recurse=True):
+                arr = node
+                break
+        if arr is None:
+            raise ValueError(f"Could not locate an image array inside {path}")
+
+    if arr.ndim == 5:
+        # Assume (T, C, Z, Y, X); take channel 0
+        return arr, True
+    elif arr.ndim == 4:
+        return arr, False
+    else:
+        raise ValueError(
+            f"Unexpected array shape {arr.shape} for {path}; expected 4D "
+            f"(T,Z,Y,X) or 5D (T,C,Z,Y,X)."
+        )
+
+
+def get_frame(arr, has_channel, t):
+    """Load a single timepoint (Z,Y,X) into memory as float32."""
+    frame = arr[t, 0] if has_channel else arr[t]
+    return np.asarray(frame, dtype=CFG.DTYPE)
+
+
+# -----------------------------------------------------------
+# EDA: dataset shapes/dtypes and a couple of visual previews
+# -------------------------------------------------------------------------
+eda_rows = []
+for ds_id, path in TEST_DATASETS.items():
+    try:
+        arr, has_ch = open_zarr_image(path)
+        t, z, y, x = (arr.shape[0], arr.shape[-3], arr.shape[-2], arr.shape[-1])
+        eda_rows.append({
+            "dataset": ds_id, "split": "test", "n_frames": t,
+            "z": z, "y": y, "x": x, "dtype": str(arr.dtype),
+            "chunks": str(arr.chunks),
+        })
+    except Exception as exc:
+        print(f"[WARN] Could not inspect test dataset {ds_id}: {exc}")
+
+for ds_id, path in TRAIN_DATASETS.items():
+    try:
+        arr, has_ch = open_zarr_image(path)
+        t, z, y, x = (arr.shape[0], arr.shape[-3], arr.shape[-2], arr.shape[-1])
+        eda_rows.append({
+            "dataset": ds_id, "split": "train", "n_frames": t,
+            "z": z, "y": y, "x": x, "dtype": str(arr.dtype),
+            "chunks": str(arr.chunks),
+        })
+    except Exception as exc:
+        print(f"[WARN] Could not inspect train dataset {ds_id}: {exc}")
+
+eda_df = pd.DataFrame(eda_rows)
+print(eda_df.to_string(index=False))
+
+if _PLOTTING and not eda_df.empty:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    sns.barplot(data=eda_df, x="dataset", y="n_frames", hue="split", ax=axes[0])
+    axes[0].set_title("Number of timepoints per dataset")
+    axes[0].tick_params(axis="x", rotation=45)
+
+    vol_df = eda_df.assign(volume_voxels=lambda d: d.z * d.y * d.x)
+    sns.barplot(data=vol_df, x="dataset", y="volume_voxels", hue="split", ax=axes[1])
+    axes[1].set_title("Volume size per frame (voxels)")
+    axes[1].tick_params(axis="x", rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(CFG.OUTPUT_DIR, "eda_dataset_shapes.png"), dpi=120)
+    plt.show()
+
+    # Intensity distribution + a mid-slice preview for a few datasets
+    preview_ids = list(TEST_DATASETS.keys())[: CFG.N_DATASETS_TO_PREVIEW]
+    fig, axes = plt.subplots(len(preview_ids), 2, figsize=(10, 4 * len(preview_ids)))
+    axes = np.atleast_2d(axes)
+    for i, ds_id in enumerate(preview_ids):
+        try:
+            arr, has_ch = open_zarr_image(TEST_DATASETS[ds_id])
+            frame = get_frame(arr, has_ch, t=0)
+            mid_z = frame.shape[0] // 2
+            axes[i, 0].imshow(frame[mid_z], cmap="gray")
+            axes[i, 0].set_title(f"{ds_id} | t=0, z={mid_z} (mid slice)")
+            axes[i, 0].axis("off")
+
+            sample = frame.ravel()
+            if sample.size > 200_000:
+                sample = np.random.choice(sample, 200_000, replace=False)
+            axes[i, 1].hist(sample, bins=80, color="steelblue")
+            axes[i, 1].set_title(f"{ds_id} intensity distribution (t=0)")
+            del frame, sample
+        except Exception as exc:
+            print(f"[WARN] Preview failed for {ds_id}: {exc}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(CFG.OUTPUT_DIR, "eda_intensity_previews.png"), dpi=120)
+    plt.show()
+    gc.collect()
+else:
+    print("Plotting libraries unavailable or no datasets found; skipping visual EDA.")
+
+
+#----------------------------------------------------------
+# Preprocessing + detection
+# -------------------------------------------------------------------------
+def preprocess_frame(frame):
+    """Denoise and normalize a single (Z,Y,X) frame."""
+    frame = frame.astype(CFG.DTYPE, copy=False)
+    smoothed = gaussian(frame, sigma=CFG.GAUSSIAN_SIGMA, preserve_range=True)
+    lo, hi = np.percentile(smoothed, [1, 99.5])
+    if hi - lo < 1e-6:
+        return smoothed
+    smoothed = np.clip((smoothed - lo) / (hi - lo), 0, 1)
+    return smoothed.astype(CFG.DTYPE)
+
+
+def detect_centroids(frame_smoothed):
+    """Detect local-maxima blob centroids in a preprocessed (Z,Y,X) frame.
+    Returns an (N,3) array of integer (z,y,x) voxel coordinates."""
+    if not np.isfinite(frame_smoothed).all() or frame_smoothed.max() <= 0:
+        return np.empty((0, 3), dtype=np.int32)
+
+    threshold_abs = np.percentile(frame_smoothed, CFG.INTENSITY_PERCENTILE)
+    threshold_abs = max(threshold_abs, 1e-4)
+
+    coords = peak_local_max(
+        frame_smoothed,
+        min_distance=CFG.MIN_DISTANCE_VOXELS,
+        threshold_abs=threshold_abs,
+        exclude_border=False,
+    )
+
+    if len(coords) > CFG.MAX_DETECTIONS_PER_FRAME:
+        # Keep the brightest peaks to bound downstream cost matrices.
+        vals = frame_smoothed[tuple(coords.T)]
+        top_idx = np.argsort(vals)[::-1][: CFG.MAX_DETECTIONS_PER_FRAME]
+        coords = coords[top_idx]
+
+    return coords.astype(np.int32)
+# -----------------------------------------------------------
+# Frame-to-frame linking (Hungarian assignment) with division handling
+# -------------------------------------------------------------------------
+SCALE = np.array([CFG.Z_SCALE_UM, CFG.Y_SCALE_UM, CFG.X_SCALE_UM], dtype=np.float64)
+
+
+def to_physical(coords_voxel):
+    return coords_voxel.astype(np.float64) * SCALE
+
+
+def link_frames(coords_prev_um, coords_next_um):
+    """Return list of (i_prev, i_next) index pairs linking two frames,
+    allowing at most 2 daughters per parent (division-aware).
+    coords_*_um are physical-unit centroid arrays, shape (N,3)."""
+    n_prev, n_next = len(coords_prev_um), len(coords_next_um)
+    if n_prev == 0 or n_next == 0:
+        return []
+
+    dist = cdist(coords_prev_um, coords_next_um)
+    cost = np.where(dist <= CFG.MAX_LINK_DIST_UM, dist, 1e6)
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    links = []
+    matched_next = set()
+    child_count = {i: 0 for i in range(n_prev)}
+
+    for r, c in zip(row_ind, col_ind):
+        if cost[r, c] < 1e6:
+            links.append((r, c))
+            matched_next.add(c)
+            child_count[r] += 1
+
+    # Division pass: try to give an unmatched next-frame detection to the
+    # nearest still-available parent (out-degree < 2) within threshold.
+    unmatched_next = [c for c in range(n_next) if c not in matched_next]
+    for c in unmatched_next:
+        candidate_parents = [r for r in range(n_prev) if child_count[r] < 2]
+        if not candidate_parents:
+            break
+        d_to_candidates = dist[candidate_parents, c]
+        best_local = np.argmin(d_to_candidates)
+        best_dist = d_to_candidates[best_local]
+        if best_dist <= CFG.DIVISION_SEARCH_DIST_UM:
+            best_parent = candidate_parents[best_local]
+            links.append((best_parent, c))
+            child_count[best_parent] += 1
+
+    return links
+
+
+#------------------------------------------------------------
+#  detect + track across 
+# -------------------------------------------------------------------------
+def process_dataset(dataset_id, zarr_path, deadline_ts):
+    """Returns (node_rows, edge_rows) as lists of dicts for one dataset.
+    Always returns at least an empty structure — never raises — so the
+    caller can guarantee every required dataset appears in the submission."""
+    node_rows, edge_rows = [], []
+    try:
+        arr, has_channel = open_zarr_image(zarr_path)
+        n_frames = arr.shape[0]
+        if CFG.MAX_FRAMES_PER_DATASET is not None:
+            n_frames = min(n_frames, CFG.MAX_FRAMES_PER_DATASET)
+
+        node_id_counter = 1
+        prev_coords_voxel = None
+        prev_node_ids = None
+
+        for t in range(n_frames):
+            if time.time() > deadline_ts:
+                print(f"[WARN] Time budget exceeded during '{dataset_id}' "
+                      f"at t={t}/{n_frames}; truncating remaining frames.")
+                break
+
+            frame = get_frame(arr, has_channel, t)
+            frame_proc = preprocess_frame(frame)
+            coords_voxel = detect_centroids(frame_proc)
+            del frame, frame_proc
+
+            cur_node_ids = []
+            for (z, y, x) in coords_voxel:
+                node_rows.append({
+                    "dataset": dataset_id, "row_type": "node",
+                    "node_id": node_id_counter, "t": int(t),
+                    "z": int(z), "y": int(y), "x": int(x),
+                    "source_id": -1, "target_id": -1,
+                })
+                cur_node_ids.append(node_id_counter)
+                node_id_counter += 1
+
+            if prev_coords_voxel is not None and len(prev_coords_voxel) and len(coords_voxel):
+                prev_um = to_physical(prev_coords_voxel)
+                cur_um = to_physical(coords_voxel)
+                links = link_frames(prev_um, cur_um)
+                for i_prev, i_cur in links:
+                    edge_rows.append({
+                        "dataset": dataset_id, "row_type": "edge",
+                        "node_id": -1, "t": -1, "z": -1, "y": -1, "x": -1,
+                        "source_id": prev_node_ids[i_prev],
+                        "target_id": cur_node_ids[i_cur],
+                    })
+
+            prev_coords_voxel = coords_voxel
+            prev_node_ids = cur_node_ids
+
+        del arr
+        gc.collect()
+
+    except Exception as exc:
+        print(f"[ERROR] Dataset '{dataset_id}' failed: {exc}")
+        traceback.print_exc()
+        # Fall back to a single placeholder node so the dataset is still
+        # represented in the submission (satisfies "every test dataset
+        # must appear" without crashing the whole run).
+        if not node_rows:
+            node_rows.append({
+                "dataset": dataset_id, "row_type": "node", "node_id": 1,
+                "t": 0, "z": 0, "y": 0, "x": 0,
+                "source_id": -1, "target_id": -1,
+            })
+
+    return node_rows, edge_rows
+
+
+# ----------------------------------------------------------
+# Run the pipeline over all test datasets
+# -------------------------------------------------------------------------
+start_ts = time.time()
+deadline_ts = start_ts + CFG.TIME_BUDGET_SECONDS
+
+all_node_rows, all_edge_rows = [], []
+summary = []
+
+for ds_id, path in tqdm(TEST_DATASETS.items(), desc="Processing test datasets"):
+    ds_start = time.time()
+    nodes, edges = process_dataset(ds_id, path, deadline_ts)
+    all_node_rows.extend(nodes)
+    all_edge_rows.extend(edges)
+    summary.append({
+        "dataset": ds_id, "n_nodes": len(nodes), "n_edges": len(edges),
+        "seconds": round(time.time() - ds_start, 1),
+    })
+    gc.collect()
+
+summary_df = pd.DataFrame(summary)
+print(summary_df.to_string(index=False))
+print(f"\nTotal runtime so far: {(time.time() - start_ts) / 60:.1f} minutes")
+
+if _PLOTTING and not summary_df.empty:
+    fig, ax = plt.subplots(figsize=(8, 4))
+    sns.barplot(data=summary_df, x="dataset", y="n_nodes", ax=ax, color="steelblue")
+    ax.set_title("Detected nodes per test dataset")
+    ax.tick_params(axis="x", rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(CFG.OUTPUT_DIR, "detections_per_dataset.png"), dpi=120)
+    plt.show()
+
+
+# ---------------------------------------------------------
+# Assemble and validate the submission file
+# -------------------------------------------------------------------------
+REQUIRED_COLUMNS = [
+    "id", "dataset", "row_type", "node_id", "t", "z", "y", "x",
+    "source_id", "target_id",
+]
+
+
+def build_submission(node_rows, edge_rows, expected_datasets):
+    rows = node_rows + edge_rows
+    if not rows:
+        raise ValueError("No rows were generated; cannot build submission.")
+
+    df = pd.DataFrame(rows)
+
+    # Guarantee every required test dataset appears at least once.
+    missing = set(expected_datasets) - set(df["dataset"].unique())
+    for ds_id in missing:
+        print(f"[WARN] Dataset '{ds_id}' had no rows; inserting placeholder node.")
+        df = pd.concat([df, pd.DataFrame([{
+            "dataset": ds_id, "row_type": "node", "node_id": 1,
+            "t": 0, "z": 0, "y": 0, "x": 0, "source_id": -1, "target_id": -1,
+        }])], ignore_index=True)
+
+    df.insert(0, "id", range(len(df)))
+
+    int_cols = ["id", "node_id", "t", "z", "y", "x", "source_id", "target_id"]
+    for c in int_cols:
+        df[c] = df[c].fillna(-1).astype(np.int64)
+
+    df = df[REQUIRED_COLUMNS]
+    return df
+
+
+def validate_submission(df, expected_datasets):
+    errs = []
+    if list(df.columns) != REQUIRED_COLUMNS:
+        errs.append(f"Column mismatch: {list(df.columns)}")
+    if set(df["row_type"].unique()) - {"node", "edge"}:
+        errs.append("Unexpected row_type values found.")
+    missing = set(expected_datasets) - set(df["dataset"].unique())
+    if missing:
+        errs.append(f"Missing required datasets: {missing}")
+    if df[int_cols_check].isna().any().any():
+        errs.append("NaN values present in numeric columns.")
+    if not df["id"].equals(pd.Series(range(len(df)))):
+        errs.append("id column is not a consecutive integer index.")
+    return errs
+
+
+int_cols_check = ["id", "node_id", "t", "z", "y", "x", "source_id", "target_id"]
+
+submission_df = build_submission(all_node_rows, all_edge_rows, TEST_DATASETS.keys())
+validation_errors = validate_submission(submission_df, TEST_DATASETS.keys())
+
+if validation_errors:
+    raise ValueError("Submission validation failed:\n" + "\n".join(validation_errors))
+
+print(f"Submission shape: {submission_df.shape}")
+print(submission_df.head(10).to_string(index=False))
+
+submission_df.to_csv(CFG.SUBMISSION_PATH, index=False)
+print(f"\nSaved submission to: {CFG.SUBMISSION_PATH}")
+print(f"Total runtime: {(time.time() - start_ts) / 60:.1f} minutes")
