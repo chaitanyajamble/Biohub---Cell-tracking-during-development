@@ -1,0 +1,631 @@
+import gc
+import glob
+import os
+import subprocess
+import sys
+import time
+import traceback
+import warnings
+import numpy as np
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# 0. CONFIGURATION
+# ---------------------------------------------------------------------------
+class CFG:
+    # --- paths (--- notebook conventions given in the task) -------------
+    COMP_DIR = "/---/input/competitions/biohub-cell-tracking-during-development"
+    ZARR_WHEELS_DIR = "/---/input/datasets/chaitanyajamble/zarr-offline-wheels"
+    WORK_DIR = "/---/working"
+    OUTPUT_CSV = os.path.join(WORK_DIR, "submission.csv")
+
+    # --- physical voxel scale (um), as specified by the competition metric -
+    SCALE_Z = 1.625
+    SCALE_Y = 0.40625
+    SCALE_X = 0.40625
+    MAX_LINK_DIST_UM = 7.0            # official matching radius
+
+    # --- detection parameters ----------------------------------------------
+    MIN_COMPONENT_VOXELS = 15         # discard components smaller than this
+    INTENSITY_PERCENTILE = 99.0       # global adaptive-threshold percentile
+    MAX_VOXELS_PER_VOLUME = 150_000_000   # trigger y/x downsampling above this
+
+    # --- division heuristic --------------------------------------------------
+    DIVISION_DIST_RATIO = 1.6         # relaxed gate multiplier for daughters
+
+    # --- runtime / resource guards ------------------------------------------
+    RANDOM_SEED = 42
+    TIME_BUDGET_SECONDS = 8 * 3600    # internal safety cap, well under 12h
+    EDA_MAX_DATASETS = 3
+    SANITY_CHECK_MAX_DATASETS = 1
+
+
+np.random.seed(CFG.RANDOM_SEED)
+_START_TIME = time.time()
+
+
+def time_left():
+    """Seconds remaining in the script's internal safety time budget."""
+    return CFG.TIME_BUDGET_SECONDS - (time.time() - _START_TIME)
+
+
+os.makedirs(CFG.WORK_DIR, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 1. ENVIRONMENT SETUP (offline zarr install)
+# ---------------------------------------------------------------------------
+def ensure_zarr_installed():
+    """
+    Makes sure `zarr` is importable. ---'s scoring container has no
+    internet access, so if zarr is not already present we install it from
+    the local offline-wheels dataset instead of hitting PyPI.
+    """
+    try:
+        import zarr  # noqa: F401
+        print(f"[SETUP] zarr already available (version {zarr.__version__}).")
+        return True
+    except ImportError:
+        print("[SETUP] zarr not found - attempting an offline install.")
+
+    if not os.path.isdir(CFG.ZARR_WHEELS_DIR):
+        print(f"[SETUP] Wheel directory not found at {CFG.ZARR_WHEELS_DIR}.")
+        return False
+
+    wheels = sorted(glob.glob(os.path.join(CFG.ZARR_WHEELS_DIR, "*.whl")))
+    if not wheels:
+        print(f"[SETUP] No .whl files found under {CFG.ZARR_WHEELS_DIR}.")
+        return False
+
+    try:
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "--no-index",
+            "--find-links", CFG.ZARR_WHEELS_DIR, "zarr",
+        ])
+        import zarr  # noqa: F401
+        print(f"[SETUP] Offline zarr install succeeded (version {zarr.__version__}).")
+        return True
+    except Exception as e:
+        print(f"[SETUP] Offline zarr install failed: {e}")
+        return False
+
+
+ZARR_AVAILABLE = ensure_zarr_installed()
+if ZARR_AVAILABLE:
+    import zarr
+
+
+# ---------------------------------------------------------------------------
+# 2. DATASET DISCOVERY
+# ---------------------------------------------------------------------------
+def discover_zarr_datasets(root_dir, split_hint):
+    """
+    Walks `root_dir` looking for directories ending in '.zarr'. Prefers
+    folders whose parent directory name contains `split_hint` (e.g. 'test'
+    or 'train'); falls back to a full recursive scan if that layout is not
+    found, since the exact directory structure is not guaranteed to match
+    across competition versions.
+    """
+    candidates = []
+    if not os.path.isdir(root_dir):
+        print(f"[DISCOVERY] Root directory not found: {root_dir}")
+        return candidates
+
+    if split_hint:
+        for dirpath, dirnames, _ in os.walk(root_dir):
+            if split_hint.lower() in os.path.basename(dirpath).lower():
+                for d in dirnames:
+                    if d.endswith(".zarr"):
+                        candidates.append(os.path.join(dirpath, d))
+        if candidates:
+            return sorted(set(candidates))
+
+    # fallback: recursive search anywhere under root_dir
+    for dirpath, dirnames, _ in os.walk(root_dir):
+        for d in dirnames:
+            if d.endswith(".zarr"):
+                candidates.append(os.path.join(dirpath, d))
+    return sorted(set(candidates))
+
+
+def find_sample_submission():
+    """Locates sample_submission.csv anywhere under the competition dir."""
+    for cand in glob.glob(os.path.join(CFG.COMP_DIR, "**", "*sample_submission*.csv"),
+                           recursive=True):
+        return cand
+    return None
+
+
+def open_zarr_volume(zarr_path):
+    """
+    Returns a lazily-indexable zarr array for the (t, z, y, x) or (z, y, x)
+    volume at `zarr_path`. Handles both a plain zarr.Array and an OME-Zarr
+    multiscale group, in which case the full-resolution level ('0') is
+    preferred.
+    """
+    store = zarr.open(zarr_path, mode="r")
+    if isinstance(store, zarr.Array):
+        return store
+
+    keys = list(store.array_keys())
+    if not keys:
+        raise ValueError(f"No arrays found in zarr group at {zarr_path}")
+    level = "0" if "0" in keys else sorted(keys)[0]
+    return store[level]
+
+
+def read_timepoint(arr, t_index, max_voxels=CFG.MAX_VOXELS_PER_VOLUME):
+    """
+    Lazily reads a single 3D (z, y, x) volume for timepoint `t_index`,
+    downsampling the y/x plane with simple striding if the full-resolution
+    volume would exceed the memory budget. z is kept at full resolution
+    since it is typically the smallest and most physically informative
+    dimension. Returns (volume_ndarray, stride_used).
+    """
+    shape = arr.shape
+    if len(shape) == 4:
+        _, z_dim, y_dim, x_dim = shape
+    elif len(shape) == 3:
+        z_dim, y_dim, x_dim = shape
+    else:
+        raise ValueError(f"Unexpected array rank {len(shape)} for shape {shape}")
+
+    stride = 1
+    while z_dim * max(1, y_dim // stride) * max(1, x_dim // stride) > max_voxels:
+        stride += 1
+
+    if len(shape) == 4:
+        vol = arr[t_index, :, ::stride, ::stride]
+    else:
+        vol = arr[:, ::stride, ::stride]
+
+    vol = np.asarray(vol)
+    vol = np.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0)
+    return vol, stride
+
+
+# ---------------------------------------------------------------------------
+# 3. EXPLORATORY DATA ANALYSIS
+# ---------------------------------------------------------------------------
+def run_eda(zarr_datasets, max_datasets=CFG.EDA_MAX_DATASETS):
+    """
+    Lightweight EDA: shapes/dtypes plus one representative mid-depth slice
+    and an intensity histogram per inspected dataset. Deliberately kept
+    small and fast (t=0 only, capped dataset count) so it never becomes the
+    runtime bottleneck against the scoring time limit.
+    """
+    if not ZARR_AVAILABLE or not zarr_datasets:
+        print("[EDA] Skipped (zarr unavailable or no datasets discovered).")
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    print("\n" + "=" * 78)
+    print("Exploratory Data Analysis")
+    print("=" * 78)
+
+    summary_rows = []
+    for zpath in zarr_datasets[:max_datasets]:
+        if time_left() < 600:
+            print("[EDA] Time budget low - stopping EDA early.")
+            break
+
+        name = os.path.basename(zpath).replace(".zarr", "")
+        try:
+            arr = open_zarr_volume(zpath)
+            print(f"[EDA] {name}: shape={arr.shape} dtype={arr.dtype}")
+            summary_rows.append({"dataset": name, "shape": str(arr.shape), "dtype": str(arr.dtype)})
+
+            vol, stride = read_timepoint(arr, 0)
+            mid_z = vol.shape[0] // 2
+            slice_img = vol[mid_z]
+
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+            axes[0].imshow(slice_img, cmap="gray")
+            axes[0].set_title(f"{name}  t=0, z={mid_z} (stride={stride})")
+            axes[0].axis("off")
+            axes[1].hist(vol.ravel(), bins=100, color="steelblue")
+            axes[1].set_yscale("log")
+            axes[1].set_title("Intensity histogram (t=0)")
+            fig.tight_layout()
+
+            out_png = os.path.join(CFG.WORK_DIR, f"eda_{name}.png")
+            fig.savefig(out_png, dpi=100)
+            plt.close(fig)
+            print(f"[EDA] figure saved -> {out_png}")
+
+            del vol
+            gc.collect()
+        except Exception as e:
+            print(f"[EDA] Failed for {zpath}: {e}")
+
+    if summary_rows:
+        print("\n[EDA] Dataset summary:")
+        print(pd.DataFrame(summary_rows).to_string(index=False))
+
+
+# ---------------------------------------------------------------------------
+# 4. DETECTION
+# ---------------------------------------------------------------------------
+def detect_cells_3d(volume, min_voxels=CFG.MIN_COMPONENT_VOXELS,
+                     percentile=CFG.INTENSITY_PERCENTILE):
+    
+    
+    
+    from scipy import ndimage as ndi
+
+    if volume is None or volume.size == 0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    vol = volume.astype(np.float32, copy=False)
+    thresh = np.percentile(vol, percentile)
+    mask = vol > thresh
+    if not mask.any():
+        return np.empty((0, 3), dtype=np.float64)
+
+    structure = np.ones((3, 3, 3), dtype=np.uint8)
+    labeled, n_labels = ndi.label(mask, structure=structure)
+    if n_labels == 0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    sizes = ndi.sum(mask, labeled, index=np.arange(1, n_labels + 1))
+    keep_labels = np.nonzero(sizes >= min_voxels)[0] + 1
+    if keep_labels.size == 0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    centroids = ndi.center_of_mass(vol, labeled, index=keep_labels)
+    return np.asarray(centroids, dtype=np.float64)
+
+
+# ---------------------------------------------------------------------------
+# 5. TRACKING / LINKING
+# ---------------------------------------------------------------------------
+def scaled_distance_matrix(pts_a, pts_b):
+    """
+    Pairwise Euclidean distance matrix in physical microns, applying the
+    competition's voxel scale (z=1.625, y=x=0.40625 um/voxel).
+    """
+    scale = np.array([CFG.SCALE_Z, CFG.SCALE_Y, CFG.SCALE_X])
+    a = pts_a * scale
+    b = pts_b * scale
+    diff = a[:, None, :] - b[None, :, :]
+    return np.sqrt((diff ** 2).sum(axis=-1))
+
+
+def link_frames(prev_pts, curr_pts, max_dist=CFG.MAX_LINK_DIST_UM):
+    """
+    Optimal one-to-one assignment between consecutive frames via the
+    Hungarian algorithm, gated at `max_dist` microns (the competition's own
+    matching radius). Returns a list of (prev_idx, curr_idx) index pairs.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    if len(prev_pts) == 0 or len(curr_pts) == 0:
+        return []
+
+    dist = scaled_distance_matrix(prev_pts, curr_pts)
+    row_ind, col_ind = linear_sum_assignment(dist)
+    return [(r, c) for r, c in zip(row_ind, col_ind) if dist[r, c] <= max_dist]
+
+
+def detect_divisions(prev_pts, curr_pts, existing_pairs,
+                      max_dist=CFG.MAX_LINK_DIST_UM, ratio=CFG.DIVISION_DIST_RATIO):
+    """
+    Heuristic division detector. The one-to-one Hungarian linkage above
+    cannot itself produce a node with two outgoing edges, so any curr-frame
+    point left unmatched is checked against its nearest prev-frame point
+    (within a relaxed distance gate). If that prev-frame point is already
+    matched to a different curr-frame point, adding this second edge turns
+    it into a division node, matching the competition's definition of a
+    division (a node with two or more outgoing edges).
+    """
+    if len(prev_pts) == 0 or len(curr_pts) == 0:
+        return []
+
+    matched_curr = {c for _, c in existing_pairs}
+    unmatched_curr = [c for c in range(len(curr_pts)) if c not in matched_curr]
+    if not unmatched_curr:
+        return []
+
+    dist = scaled_distance_matrix(prev_pts, curr_pts)
+    extra_pairs = []
+    for c in unmatched_curr:
+        p_best = int(np.argmin(dist[:, c]))
+        d_best = dist[p_best, c]
+        if d_best <= max_dist * ratio:
+            extra_pairs.append((p_best, c))
+    return extra_pairs
+
+
+# ---------------------------------------------------------------------------
+# 
+# ---------------------------------------------------------------------------
+def find_ground_truth_csv(train_zarr_path):
+    """
+    Attempts to locate a ground-truth tracks CSV next to a train zarr
+    folder, trying a few common naming conventions. Returns None if nothing
+    plausible is found - this check is a convenience only, never required
+    for producing the submission.
+    """
+    base_dir = os.path.dirname(train_zarr_path)
+    name = os.path.basename(train_zarr_path).replace(".zarr", "")
+    candidates = [
+        os.path.join(base_dir, f"{name}.csv"),
+        os.path.join(base_dir, f"{name}_tracks.csv"),
+        os.path.join(base_dir, "tracks", f"{name}.csv"),
+        os.path.join(base_dir, name, "tracks.csv"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    for c in glob.glob(os.path.join(base_dir, f"*{name}*.csv")):
+        return c
+    return None
+
+
+def sanity_check_against_train(max_datasets=CFG.SANITY_CHECK_MAX_DATASETS):
+    """
+    Best-effort self-evaluation: runs the detector on t=0 of up to
+    `max_datasets` training volumes and reports what fraction of
+    ground-truth centroids have a predicted centroid within the
+    competition's matching radius. This is a rough proxy for detector
+    recall, useful as a quick cross-check - it is NOT the official edge /
+    division Jaccard metric and has no bearing on submission generation.
+    """
+    if not ZARR_AVAILABLE:
+        print("[SANITY-CHECK] Skipped (zarr unavailable).")
+        return
+
+    train_datasets = discover_zarr_datasets(CFG.COMP_DIR, "train")
+    if not train_datasets:
+        print("[SANITY-CHECK] Skipped (no train zarr datasets discovered).")
+        return
+
+    print("\n" + "=" * 78)
+    print("Training-set sanity check (approximate recall @ matching radius)")
+    print("=" * 78)
+
+    checked = 0
+    for zpath in train_datasets:
+        if checked >= max_datasets or time_left() < 600:
+            break
+        name = os.path.basename(zpath).replace(".zarr", "")
+        gt_path = find_ground_truth_csv(zpath)
+        if gt_path is None:
+            continue
+        try:
+            gt_df = pd.read_csv(gt_path)
+            gt_df.columns = [c.lower() for c in gt_df.columns]
+            if not {"t", "z", "y", "x"}.issubset(gt_df.columns):
+                continue
+
+            gt_t0 = gt_df[gt_df["t"] == gt_df["t"].min()]
+            if gt_t0.empty:
+                continue
+
+            arr = open_zarr_volume(zpath)
+            vol, stride = read_timepoint(arr, 0)
+            pred_pts = detect_cells_3d(vol)
+            if stride > 1 and pred_pts.size > 0:
+                pred_pts[:, 1] *= stride
+                pred_pts[:, 2] *= stride
+
+            gt_pts = gt_t0[["z", "y", "x"]].to_numpy(dtype=np.float64)
+            if len(pred_pts) == 0 or len(gt_pts) == 0:
+                print(f"[SANITY-CHECK] {name}: nothing to compare "
+                      f"(pred={len(pred_pts)}, gt={len(gt_pts)}).")
+                continue
+
+            dist = scaled_distance_matrix(gt_pts, pred_pts)
+            nearest = dist.min(axis=1)
+            recall = float((nearest <= CFG.MAX_LINK_DIST_UM).mean())
+            print(f"[SANITY-CHECK] {name}: approx recall @ {CFG.MAX_LINK_DIST_UM}um "
+                  f"= {recall:.3f} (gt_nodes={len(gt_pts)}, pred_nodes={len(pred_pts)})")
+            checked += 1
+            del vol
+            gc.collect()
+        except Exception as e:
+            print(f"[SANITY-CHECK] Failed for {name}: {e}")
+
+    if checked == 0:
+        print("[SANITY-CHECK] No usable train ground-truth files were found.")
+# ---------------------------------------------------------------------------
+# 7. PER-DATASET DETECTION + TRACKING PIPELINE
+# ---------------------------------------------------------------------------
+def process_dataset(zarr_path, dataset_name):
+    """
+    Runs detection and frame-to-frame linking for one dataset volume,
+    returning plain-dict node and edge lists ready for submission assembly.
+    Robust to per-timepoint failures: a bad frame is skipped (logged) and
+    tracking continues from the next successfully-read frame.
+    """
+    nodes, edges = [], []
+
+    try:
+        arr = open_zarr_volume(zarr_path)
+    except Exception as e:
+        print(f"  [WARN] Could not open {zarr_path}: {e}")
+        return nodes, edges
+
+    shape = arr.shape
+    n_timepoints = shape[0] if len(shape) == 4 else 1
+    print(f"  dataset={dataset_name}  shape={shape}  timepoints={n_timepoints}")
+
+    next_node_id = 1
+    prev_pts_voxel = None
+    prev_node_ids = None
+
+    for t in range(n_timepoints):
+        if time_left() < 300:
+            print("  [WARN] Time budget nearly exhausted - truncating remaining timepoints.")
+            break
+
+        try:
+            vol, stride = read_timepoint(arr, t)
+            pts = detect_cells_3d(vol)
+            if stride > 1 and pts.size > 0:
+                pts[:, 1] *= stride
+                pts[:, 2] *= stride
+            del vol
+        except Exception as e:
+            print(f"  [WARN] Timepoint {t} failed for {dataset_name}: {e}")
+            pts = np.empty((0, 3))
+
+        curr_ids = []
+        for (z, y, x) in pts:
+            nid = next_node_id
+            next_node_id += 1
+            nodes.append({
+                "dataset": dataset_name, "node_id": nid, "t": t,
+                "z": int(round(float(z))), "y": int(round(float(y))), "x": int(round(float(x))),
+            })
+            curr_ids.append(nid)
+
+        if prev_pts_voxel is not None and len(prev_pts_voxel) > 0 and len(pts) > 0:
+            try:
+                pairs = link_frames(prev_pts_voxel, pts)
+                div_pairs = detect_divisions(prev_pts_voxel, pts, pairs)
+                for p_idx, c_idx in pairs + div_pairs:
+                    edges.append({
+                        "dataset": dataset_name,
+                        "source_id": prev_node_ids[p_idx],
+                        "target_id": curr_ids[c_idx],
+                    })
+            except Exception as e:
+                print(f"  [WARN] Linking failed between t={t - 1} and t={t}: {e}")
+
+        prev_pts_voxel = pts
+        prev_node_ids = curr_ids
+        gc.collect()
+
+    return nodes, edges
+
+
+# ---------------------------------------------------------------------------
+# 8. SUBMISSION ASSEMBLY
+# ---------------------------------------------------------------------------
+def build_submission(all_nodes, all_edges, output_path=CFG.OUTPUT_CSV):
+    """
+    Assembles the long-format submission required by the competition:
+    node rows carry (node_id, t, z, y, x) with source_id/target_id = -1,
+    edge rows carry (source_id, target_id) with node_id/t/z/y/x = -1, and
+    `id` is a plain consecutive row index.
+    """
+    cols = ["id", "dataset", "row_type", "node_id", "t", "z", "y", "x", "source_id", "target_id"]
+    rows = []
+    idx = 0
+
+    for n in all_nodes:
+        rows.append({
+            "id": idx, "dataset": n["dataset"], "row_type": "node",
+            "node_id": n["node_id"], "t": n["t"], "z": n["z"], "y": n["y"], "x": n["x"],
+            "source_id": -1, "target_id": -1,
+        })
+        idx += 1
+
+    for e in all_edges:
+        rows.append({
+            "id": idx, "dataset": e["dataset"], "row_type": "edge",
+            "node_id": -1, "t": -1, "z": -1, "y": -1, "x": -1,
+            "source_id": e["source_id"], "target_id": e["target_id"],
+        })
+        idx += 1
+
+    df = pd.DataFrame(rows, columns=cols)
+    df.to_csv(output_path, index=False)
+    print(f"\nSubmission written to {output_path}")
+    print(f"  total rows  : {len(df)}")
+    print(f"  node rows   : {len(all_nodes)}")
+    print(f"  edge rows   : {len(all_edges)}")
+    print(f"  datasets    : {df['dataset'].nunique()}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 9. MAIN
+# ---------------------------------------------------------------------------
+def main():
+    print("=" * 78)
+    print("Biohub - Cell Tracking During Development : Baseline Pipeline")
+    print("=" * 78)
+
+    # --- discover test datasets --------------------------------------------
+    zarr_datasets = discover_zarr_datasets(CFG.COMP_DIR, "test")
+    print(f"Discovered {len(zarr_datasets)} test zarr dataset(s):")
+    for p in zarr_datasets:
+        print(f"  - {p}")
+
+    # --- cross-check against sample_submission.csv, if available -----------
+    expected_datasets = None
+    sample_sub_path = find_sample_submission()
+    if sample_sub_path:
+        try:
+            sample_df = pd.read_csv(sample_sub_path)
+            if "dataset" in sample_df.columns:
+                expected_datasets = list(pd.unique(sample_df["dataset"]))
+                print(f"Sample submission references {len(expected_datasets)} dataset(s).")
+        except Exception as e:
+            print(f"[WARN] Could not parse sample submission at {sample_sub_path}: {e}")
+
+    # --- EDA -----------------------------------------------------------------
+    try:
+        run_eda(zarr_datasets)
+    except Exception as e:
+        print(f"[WARN] EDA step failed (non-fatal): {e}")
+
+    # --- optional training sanity check --------------------------------------
+    try:
+        sanity_check_against_train()
+    except Exception as e:
+        print(f"[WARN] Training sanity check failed (non-fatal): {e}")
+
+    # --- detection + tracking on the test set --------------------------------
+    all_nodes, all_edges = [], []
+    processed_names = set()
+
+    if not ZARR_AVAILABLE:
+        print("[ERROR] zarr is unavailable - cannot read microscopy volumes. "
+              "Falling back to a placeholder submission.")
+    else:
+        print("\n" + "=" * 78)
+        print("Detection and tracking")
+        print("=" * 78)
+        for zpath in zarr_datasets:
+            if time_left() < 300:
+                print("[WARN] Global time budget nearly exhausted - stopping dataset loop.")
+                break
+            dataset_name = os.path.basename(zpath).replace(".zarr", "")
+            print(f"\nProcessing dataset: {dataset_name}")
+            try:
+                nodes, edges = process_dataset(zpath, dataset_name)
+            except Exception as e:
+                print(f"[WARN] Dataset {dataset_name} failed entirely: {e}")
+                traceback.print_exc()
+                nodes, edges = [], []
+            all_nodes.extend(nodes)
+            all_edges.extend(edges)
+            processed_names.add(dataset_name)
+
+    # ---dataset is represented ----------------------
+    if expected_datasets:
+        for name in expected_datasets:
+            if name not in processed_names:
+                print(f"[WARN] Dataset '{name}' missing from output - "
+                      f"inserting a placeholder node so it appears in the submission.")
+                all_nodes.append({"dataset": name, "node_id": 1, "t": 0, "z": 0, "y": 0, "x": 0})
+
+    # --- last-resort fallback so a valid file is always produced --------------
+    if not all_nodes and not all_edges:
+        print("[WARN] No detections were produced at all - writing a minimal placeholder submission.")
+        all_nodes = [{"dataset": "placeholder", "node_id": 1, "t": 0, "z": 0, "y": 0, "x": 0}]
+
+    submission_df = build_submission(all_nodes, all_edges)
+    print("\nDone.")
+    return submission_df
+
+
+if __name__ == "__main__":
+    main()
